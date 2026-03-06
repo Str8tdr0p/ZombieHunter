@@ -41,7 +41,8 @@ IGNORED_IPS = {
 KNOWN_BAD_SHA256S = {
     '38a723210c18e81de8f33db79cfe8bae050a98d9d2eacdeb4f35dabbf7bd0cee',
     'ac746508938646c0cfae3f1d33f15bae718efbc7f0972426c41555e02e6f9770',
-    '869f9771ea1f9b6bf7adbd2663d71dbc041fafcbf68e878542c8639a6ba23066'
+    '869f9771ea1f9b6bf7adbd2663d71dbc041fafcbf68e878542c8639a6ba23066',
+    'd93d48802aa3ccefa74ae09a6a86eafa7554490d884c00b531a9bfe81981fb06'
 }
 
 def hex_to_ip(h):
