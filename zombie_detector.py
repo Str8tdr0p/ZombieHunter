@@ -11,7 +11,8 @@ import csv
 import os
 import tarfile
 import sys
-from urllib.parse import urlparse # Added for more robust URL filtering
+from urllib.parse import urlparse
+import hashlib # Added for SHA256 hash matching
 
 # --- Patterns ---
 
@@ -35,6 +36,12 @@ IGNORED_IPS = {
     "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
     "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
     "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+}
+
+# Known bad SHA256 hashes for binary detection
+KNOWN_BAD_SHA256S = {
+    '38a723210c18e81de8f33db79cfe8bae050a98d9d2eacdeb4f35dabbf7bd0cee',
+    'ac746508938646c0cfae3f1d33f15bae718efbc7f0972426c41555e02e6f9770'
 }
 
 # --- Helpers ---
@@ -171,13 +178,13 @@ def is_ignored_url(url_value):
 
         # To robustly parse the domain, ensure the URL has a scheme
         parsed_url = urlparse(url_lower if '://' in url_lower else 'http://' + url_lower)
-        host = parsed_url.netloc.lower()
+        host_to_check = parsed_url.hostname # Use .hostname to get the host without the port
 
-        if not host: # If host still couldn't be parsed (e.g., 'user:password' would result in host='')
+        if host_to_check is None: # If no valid hostname could be parsed (e.g., 'user:password' or malformed)
             return False
 
         for domain in IGNORED_URL_DOMAINS:
-            if host == domain or host.endswith('.' + domain): # Handle subdomains as well
+            if host_to_check == domain or host_to_check.endswith('.' + domain): # Handle subdomains as well
                 return True
         return False
     except Exception:
@@ -230,16 +237,16 @@ def analyze_sysdiagnose_tarball(archive_path):
 
     all_harvested_ids = set()   # 32-char hex, lowercase, no dashes
     id_to_log_map = {}          # uuid32 -> tracev3 filename
-    # tracev3_cache = {}          # filename -> raw bytes (for phase 3) # Removed
-    zombie_uuids = set()        # confirmed zombie uuid32s
-    zombie_to_binary = {}       # uuid32 -> dsc/uuidtext filename
-    binary_c2 = {}              # binary filename -> [c2 hit dicts]
+    zombie_uuids = set()        # confirmed zombie uuid32s (from UUID_MATCH detections)
+
+    # New data structure to store details for each detected zombie binary
+    zombie_binary_details = {} # binary_name -> {uuids_matched, sha256_hash, detection_methods, c2_hits}
 
     # -------------------------------------------------------------------------
     # SINGLE PASS: harvest UUIDs from tracev3, detect zombies in dsc/uuidtext,
     # and immediately scan confirmed zombie binaries for hardcoded C2
     # -------------------------------------------------------------------------
-    print("[*] Phase 1+2: Single-pass tar scan...")
+    print("[*] Phase 1+2: Single-pass tar scan (UUID & SHA256 detection)..."
 
     try:
         with tarfile.open(archive_path, "r:*") as tar:
@@ -257,11 +264,23 @@ def analyze_sysdiagnose_tarball(archive_path):
                         norm = uid.lower().replace('-', '')
                         all_harvested_ids.add(norm)
                         id_to_log_map[norm] = m.name
-                    # tracev3_cache[m.name] = data # Removed
 
                 elif 'dsc' in m.name or 'uuidtext' in m.name:
-                    data_lower = data.lower()
+                    binary_name = m.name
 
+                    # Calculate SHA256 hash for the binary content
+                    sha256_hash = hashlib.sha256(data).hexdigest()
+
+                    # Initialize/get details for this binary
+                    current_binary_details = zombie_binary_details.setdefault(binary_name, {
+                        'uuids_matched': set(),
+                        'sha256_hash': sha256_hash,
+                        'detection_methods': set(),
+                        'c2_hits': []
+                    })
+
+                    # --- UUID Detection Logic ---
+                    data_lower = data.lower()
                     found_in_binary = {
                         hit.group(0).decode('ascii')
                         for hit in UUID_SCAN_RE.finditer(data_lower)
@@ -270,31 +289,42 @@ def analyze_sysdiagnose_tarball(archive_path):
 
                     if matches:
                         for uid in matches:
-                            zombie_uuids.add(uid)
-                            zombie_to_binary[uid] = m.name
+                            zombie_uuids.add(uid) # Add to global set of zombie UUIDs
+                            current_binary_details['uuids_matched'].add(uid) # Add to binary-specific set
+                        current_binary_details['detection_methods'].add('UUID_MATCH')
 
-                        print(f"  [!] ZOMBIE BINARY: {m.name}")
-                        print(f"      Matched UUIDs: {len(matches)}")
+                    # --- SHA256 Hash Matching Logic ---
+                    if sha256_hash in KNOWN_BAD_SHA256S:
+                        current_binary_details['detection_methods'].add('HASH_MATCH')
+
+                    # If this binary is identified as a zombie by *any* method
+                    if current_binary_details['detection_methods']:
+                        print(f"  [!] ZOMBIE BINARY: {binary_name}")
+                        print(f"      SHA256: {sha256_hash}")
+                        print(f"      Detection Method(s): {', '.join(sorted(list(current_binary_details['detection_methods'])))}")
+                        if current_binary_details['uuids_matched']:
+                            print(f"      Matched UUIDs: {len(current_binary_details['uuids_matched'])}")
 
                         c2_hits = extract_hardcoded_c2(data_lower)
-                        binary_c2[m.name] = c2_hits
+                        current_binary_details['c2_hits'] = c2_hits
 
-                        if c2_hits: # Now 'c2_hits' is already filtered
+                        if c2_hits:
                             num_c2_ips = len([hit for hit in c2_hits if hit['type'] == 'hex_ip_port443'])
                             num_suspicious_urls = len([hit for hit in c2_hits if hit['type'] == 'suspicious_url'])
-                            print(f"      Hardcoded C2 indicators found: {num_c2_ips} (IPs) / {num_suspicious_urls} (Suspicious URLs) (filtered)") # Updated console print
+                            print(f"      Hardcoded C2 indicators found: {num_c2_ips} (IPs) / {num_suspicious_urls} (Suspicious URLs) (filtered)")
                             for hit in c2_hits:
                                 if hit['type'] == 'hex_ip_port443':
                                     print(f"        [{hit['confidence']}] C2 indicator: {hit['value']}")
-                                elif hit['type'] == 'suspicious_url': # Now checking for 'suspicious_url'
-                                    print(f"        [{hit['confidence']}] Suspicious URL: {hit['value']}") # Updated label
+                                elif hit['type'] == 'suspicious_url':
+                                    print(f"        [{hit['confidence']}] Suspicious URL: {hit['value']}")
                         else:
-                            print(f"      No relevant hardcoded C2 or suspicious URLs found in binary (after filtering)") # Updated text
+                            print(f"      No relevant hardcoded C2 or suspicious URLs found in binary (after filtering)")
 
-                        out_bin = os.path.join(out_dir, f"ZOMBIE_{os.path.basename(m.name)}.bin")
+                        # Write the original binary data, not lowercased
+                        out_bin = os.path.join(out_dir, f"ZOMBIE_{os.path.basename(binary_name)}.bin")
                         if not os.path.exists(out_bin):
                             with open(out_bin, 'wb') as df:
-                                df.write(data_lower)
+                                df.write(data)
 
     except Exception as e:
         print(f"[!] Error during scan: {e}")
@@ -302,10 +332,28 @@ def analyze_sysdiagnose_tarball(archive_path):
 
     print()
     print(f"[*] {len(all_harvested_ids)} UUIDs harvested from logs")
-    print(f"[*] {len(zombie_uuids)} zombie UUIDs confirmed")
+
+    # Calculate summary counts for detected binaries and methods
+    total_zombie_binaries = len(zombie_binary_details)
+    num_hash_only_matches = 0
+    num_uuid_only_matches = 0
+    num_both_matches = 0
+
+    for binary_name, details in zombie_binary_details.items():
+        is_uuid = 'UUID_MATCH' in details['detection_methods']
+        is_hash = 'HASH_MATCH' in details['detection_methods']
+
+        if is_uuid and is_hash:
+            num_both_matches += 1
+        elif is_uuid:
+            num_uuid_only_matches += 1
+        elif is_hash:
+            num_hash_only_matches += 1
+
+    print(f"[*] {total_zombie_binaries} zombie binaries detected by any method")
     print()
 
-    if not zombie_uuids:
+    if not zombie_binary_details: # Check if any binaries were detected as zombie
         print("[+] No zombies detected — device clean")
         return
 
@@ -313,39 +361,6 @@ def analyze_sysdiagnose_tarball(archive_path):
     print("  ZOMBIE CONFIRMED")
     print("=" * 70)
     print()
-
-    # -------------------------------------------------------------------------
-    # PHASE 3 (SECONDARY): tracev3 proximity scan for runtime connections
-    # Removed as per user request
-    # -------------------------------------------------------------------------
-    # print("[*] Phase 3: Tracev3 proximity scan (secondary/runtime evidence)...")
-
-    # zombie_flows = []
-    # PROXIMITY_WINDOW = 512
-
-    # for tname, content in tracev3_cache.items():
-    #     content_lower = content.lower()
-
-    #     for uid in zombie_uuids:
-    #         uid_bytes = uid.encode()
-    #         for uuid_match in re.finditer(re.escape(uid_bytes), content_lower):
-    #             start = max(0, uuid_match.start() - PROXIMITY_WINDOW)
-    #             end = min(len(content_lower), uuid_match.end() + PROXIMITY_WINDOW)
-    #             chunk = content_lower[start:end]
-
-    #             for anchor in ANCHOR_RE.finditer(chunk):
-    #                 ip = hex_to_ip(anchor.group(1).decode('ascii').lower())
-    #                 if is_valid_public_ip(ip):
-    #                     zombie_flows.append({
-    #                         'zombie_binary': zombie_to_binary.get(uid, 'UNKNOWN'),
-    #                         'zombie_uuid': uid,
-    #                         'destination_ip': ip,
-    #                         'source': 'tracev3_runtime',
-    #                         'trace_log': tname
-    #                     })
-
-    # print(f"[*] {len(zombie_flows)} runtime connections mapped from logs") # Removed
-    # print()
 
     # -------------------------------------------------------------------------
     # PHASE 4: Write reports
@@ -356,100 +371,4 @@ def analyze_sysdiagnose_tarball(archive_path):
     with open(report_path, "w", encoding='utf-8') as f:
         f.write("=" * 70 + "\n")
         f.write("  ZOMBIE DETECTOR v3.0 — FORENSIC REPORT\n")
-        f.write("=" * 70 + "\n\n")
-
-        f.write(">>> PRIMARY: HARDCODED C2 AND SUSPICIOUS URLS IN ZOMBIE BINARIES <<<\n")
-        f.write("-" * 70 + "\n\n")
-
-        any_relevant_c2 = False
-        for binary_name, hits in binary_c2.items():
-            uuids_in_binary = [u for u, b in zombie_to_binary.items() if b == binary_name]
-            f.write(f"Binary: {binary_name}\n")
-            f.write(f"Zombie UUIDs matched: {len(uuids_in_binary)}\n")
-
-            # Filter hits for reporting based on user's request
-            filtered_hex_ip_hits = [hit for hit in hits if hit['type'] == 'hex_ip_port443']
-            filtered_suspicious_urls = [hit for hit in hits if hit['type'] == 'suspicious_url'] # Now using 'suspicious_url' type
-
-            if filtered_hex_ip_hits or filtered_suspicious_urls:
-                any_relevant_c2 = True
-
-                f.write(f"  C2 Indicators (hex_ip_port443):\n") # Changed title
-                if filtered_hex_ip_hits:
-                    for hit in filtered_hex_ip_hits:
-                        f.write(f"    [{hit['confidence']}] C2 indicator: {hit['value']}\n") # Changed type label
-                else:
-                    f.write("    None found.\n")
-
-                f.write(f"  Suspicious URLs:\n") # Simplified title
-                if filtered_suspicious_urls:
-                    for hit in filtered_suspicious_urls:
-                        f.write(f"    [{hit['confidence']}] Suspicious URL: {hit['value']}\n") # Changed type label
-                else:
-                    f.write("    None found.\n")
-            else:
-                f.write("  No relevant C2 indicators (hex_ip_port443) or suspicious URLs found in this binary.\n") # Updated text
-            f.write("\n")
-
-        if not any_relevant_c2:
-            f.write("No relevant C2 indicators (hex_ip_port443) or suspicious URLs found in any zombie binary.\n") # Updated text
-            f.write("(Other IP types and ignored URLs are not prioritized in this report.)\n\n") # Updated explanation
-
-        # Removed SECONDARY: RUNTIME CONNECTIONS (tracev3 logs) section as per user request
-        # f.write("\n>>> SECONDARY: RUNTIME CONNECTIONS (tracev3 logs) <<<\n")
-        # f.write("-" * 70 + "\n\n")
-
-        # if zombie_flows:
-        #     seen_flows = set()
-        #     for flow in zombie_flows:
-        #         key = (flow['zombie_binary'], flow['destination_ip'])
-        #         if key not in seen_flows:
-        #             seen_flows.add(key)
-        #             f.write(f"  Binary: {flow['zombie_binary']}\n")
-        #             f.write(f"  IP:     {flow['destination_ip']}\n")
-        #             f.write(f"  Log:    {flow['trace_log']}\n\n")
-        # else:
-        #     f.write("  No runtime connections mapped from logs.\n\n")
-
-        f.write("\n>>> ZOMBIE UUID LIST <<<\n")
-        f.write("-" * 70 + "\n\n")
-        for uid in sorted(zombie_uuids):
-            f.write(f"  UUID:   {uid}\n")
-            f.write(f"  Binary: {zombie_to_binary.get(uid, 'N/A')}\n")
-            f.write(f"  Log:    {id_to_log_map.get(uid, 'N/A')}\n\n")
-
-    # Removed CSV file generation blocks as per user request
-    # c2_rows and zombie_flows are still populated for potential future use or debugging if needed elsewhere
-
-    print("=" * 70)
-    print("  ZOMBIE DETECTION COMPLETE")
-    print("=" * 70)
-    print(f"  Zombie binaries:          {len(binary_c2)}")
-    print(f"  Zombie UUIDs:             {len(zombie_uuids)}")
-    
-    total_c2_ips_for_summary = 0
-    total_suspicious_urls_for_summary = 0
-    for binary_name, hits in binary_c2.items():
-        total_c2_ips_for_summary += len([hit for hit in hits if hit['type'] == 'hex_ip_port443'])
-        total_suspicious_urls_for_summary += len([hit for hit in hits if hit['type'] == 'suspicious_url'])
-
-    print(f"  Hardcoded C2 indicators (IPs): {total_c2_ips_for_summary}")
-    print(f"  Suspicious URLs:         {total_suspicious_urls_for_summary}")
-    # print(f"  Runtime connections:       {len(zombie_flows)}") # Removed
-    print()
-    print(f"  Evidence written to: {out_dir}/")
-    print(f"    ZOMBIE_REPORT.txt        — full forensic report (filtered as requested)")
-    print(f"    ZOMBIE_*.bin             — extracted zombie binaries")
-    # Removed CSV file printing references as well
-    print("=" * 70)
-
-
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python zombie_detector.py <sysdiagnose.tar.gz>")
-        return 1
-    analyze_sysdiagnose_tarball(sys.argv[1])
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
+        f.write(
