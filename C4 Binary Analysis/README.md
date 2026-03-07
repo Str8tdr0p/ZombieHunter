@@ -234,7 +234,7 @@ campaign whose infrastructure has not been previously observed or reported.
 |---|---|---|---|
 | `200.152.70.35` | AS14463 TDKOM INFORMÁTICA | Osasco, São Paulo, BR | EOL server (Apache 2.2.11/PHP 5.2.11), 387 CVEs, port 7547 (TR-069) open |
 | `107.195.166.114` | AS7018 AT&T Corp | Cicero, Illinois, US | AT&T residential SBC/lightspeed DSL — compromised consumer relay |
-| `136.133.187.184` | Ford Motor Company | Dearborn, Michigan, US | Private corporate IP, no rDNS, not in Shodan — anomalous corporate node |
+| `136.133.187.184` | Ford Motor Company Owned/Mazda NA Administered  | Dearborn, Michigan, US | Private corporate IP, no rDNS, not in Shodan — anomalous corporate node |
 | `207.135.206.181` | AS400072 Thunderbox/GBIS Holdings | Reno, Nevada, US | Flagged proxy — holding company ISP consistent with obfuscation infrastructure |
 | `246.48.148.156` | Class E reserved | — | VT tagged `reserved`, `private` — sub-OS IPC |
 | `244.25.215.0` | Class E reserved | — | VT tagged `reserved`, `private` — hardware boot loopback |
