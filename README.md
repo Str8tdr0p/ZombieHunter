@@ -1,5 +1,5 @@
 # ZombieHunter
-### iOS Silicon Detector
+### iOS Silicon Implant Detector
 
 ### Stepped-On Silicon | Dirty iPhones Pass the Purity Test
 
